@@ -1,0 +1,31 @@
+model EvaluationCorrection {
+  id                 String   @id @default(uuid())
+  evaluationId       String
+  classId            String
+  studentId          String
+  status             String
+  imageUrl           String?
+  suggestedScore     Float
+  finalScore         Float?
+  correctCount       Int
+  wrongCount         Int
+  blankCount         Int
+  multipleCount      Int
+  totalQuestions     Int
+  confidence         Float
+  requiresReview     Boolean  @default(true)
+  shouldRetakeImage  Boolean  @default(false)
+  failures           Json
+  detectedAnswers    Json
+  answerKey          Json
+  reviewedById       String?
+  reviewedAt         DateTime?
+  createdById        String
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([evaluationId])
+  @@index([classId])
+  @@index([studentId])
+  @@unique([evaluationId, studentId])
+}
