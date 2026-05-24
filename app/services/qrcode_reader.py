@@ -46,8 +46,13 @@ def qr_preprocessing_variants(image: np.ndarray) -> list[np.ndarray]:
 
     resized: list[np.ndarray] = []
     for variant in variants:
+        pad = max(16, int(min(variant.shape[:2]) * 0.1))
         resized.append(variant)
-        resized.append(cv2.resize(variant, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC))
+        resized.append(cv2.copyMakeBorder(variant, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255))
+        for scale in (1.5, 2.0):
+            scaled = cv2.resize(variant, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            scaled_pad = max(24, int(min(scaled.shape[:2]) * 0.08))
+            resized.append(cv2.copyMakeBorder(scaled, scaled_pad, scaled_pad, scaled_pad, scaled_pad, cv2.BORDER_CONSTANT, value=255))
     return resized
 
 
@@ -94,11 +99,16 @@ def decode_with_opencv(image: np.ndarray) -> QRCodeReport | None:
 
 
 def read_qr_code(image: np.ndarray) -> QRCodeReport:
-    report = decode_with_pyzbar(image) or decode_with_opencv(image)
+    warnings = ["QR_NOT_FOUND"]
+    if decode is not None:
+        report = decode_with_pyzbar(image)
+        if report:
+            return report
+
+    report = decode_with_opencv(image)
     if report:
         return report
 
-    warnings = ["QR_NOT_FOUND"]
     if decode is None:
         warnings.append("QR_DECODER_UNAVAILABLE")
     return QRCodeReport(found=False, warnings=warnings)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+import gc
 from typing import Any
 
 import cv2
@@ -25,6 +27,9 @@ from app.services.layout import (
 )
 from app.services.qrcode_reader import read_qr_code
 
+cv2.setUseOptimized(True)
+cv2.setNumThreads(settings.opencv_threads)
+
 
 def decode_image(image_bytes: bytes) -> np.ndarray:
     buffer = np.frombuffer(image_bytes, dtype=np.uint8)
@@ -41,12 +46,15 @@ def decode_pdf_first_page(pdf_bytes: bytes) -> np.ndarray:
         raise ValueError("PDF_DECODE_FAILED") from error
 
     try:
-        if len(document) < 1:
+        page_count = len(document)
+        if page_count < 1:
             raise ValueError("PDF_EMPTY")
+        if page_count > settings.max_pdf_pages:
+            raise ValueError("PDF_PAGE_LIMIT_EXCEEDED")
 
         page = document[0]
         try:
-            bitmap = page.render(scale=2.6)
+            bitmap = page.render(scale=settings.pdf_render_scale)
             pil_image = bitmap.to_pil().convert("RGB")
         finally:
             close_page = getattr(page, "close", None)
@@ -61,11 +69,51 @@ def decode_pdf_first_page(pdf_bytes: bytes) -> np.ndarray:
             close_document()
 
 
+def decode_pdf_pages(pdf_bytes: bytes) -> list[np.ndarray]:
+    try:
+        document = pdfium.PdfDocument(pdf_bytes)
+    except Exception as error:
+        raise ValueError("PDF_DECODE_FAILED") from error
+
+    try:
+        page_count = len(document)
+        if page_count < 1:
+            raise ValueError("PDF_EMPTY")
+        if page_count > settings.max_pdf_pages:
+            raise ValueError("PDF_PAGE_LIMIT_EXCEEDED")
+
+        pages: list[np.ndarray] = []
+        for index in range(page_count):
+            page = document[index]
+            try:
+                bitmap = page.render(scale=settings.pdf_render_scale)
+                pil_image = bitmap.to_pil().convert("RGB")
+            finally:
+                close_page = getattr(page, "close", None)
+                if callable(close_page):
+                    close_page()
+
+            rgb = np.array(pil_image)
+            pages.append(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        return pages
+    finally:
+        close_document = getattr(document, "close", None)
+        if callable(close_document):
+            close_document()
+
+
 def decode_omr_file(file_bytes: bytes, content_type: str | None = None) -> np.ndarray:
     normalized_type = (content_type or "").split(";")[0].strip().lower()
     if normalized_type == "application/pdf" or file_bytes.startswith(b"%PDF"):
         return decode_pdf_first_page(file_bytes)
     return decode_image(file_bytes)
+
+
+def decode_omr_pages(file_bytes: bytes, content_type: str | None = None) -> list[np.ndarray]:
+    normalized_type = (content_type or "").split(";")[0].strip().lower()
+    if normalized_type == "application/pdf" or file_bytes.startswith(b"%PDF"):
+        return decode_pdf_pages(file_bytes)
+    return [decode_image(file_bytes)]
 
 
 def order_points(points: np.ndarray) -> np.ndarray:
@@ -188,7 +236,77 @@ def dark_ratio(image: np.ndarray) -> float:
     return cv2.countNonZero(threshold) / max(threshold.size, 1)
 
 
-def qr_region_score(card: np.ndarray) -> float:
+def qr_report_rank(report: QRCodeReport) -> int:
+    if report.parsed:
+        return 3
+    if report.raw:
+        return 2
+    if report.found:
+        return 1
+    return 0
+
+
+def best_qr_report(*reports: QRCodeReport) -> QRCodeReport:
+    return max(reports, key=qr_report_rank)
+
+
+def skipped_qr_report() -> QRCodeReport:
+    return QRCodeReport(found=False, raw=None, parsed=None, warnings=["QR_SKIPPED"])
+
+
+def read_card_qr_code(card: np.ndarray) -> QRCodeReport:
+    reports: list[QRCodeReport] = []
+    primary_regions = [
+        (45, 330, 705, 1035),
+        (50, 310, 720, 990),
+        (60, 300, 735, 975),
+        (45, 315, 710, 980),
+    ]
+    fallback_regions = [
+        (50, 320, 725, 985),
+        (45, 330, 705, 1035),
+        (40, 300, 740, 1010),
+        (30, 350, 680, 1040),
+        (72, 262, 780, 970),
+        (55, 285, 755, 995),
+        (20, 360, 650, 1060),
+    ]
+
+    for y1, y2, x1, x2 in primary_regions:
+        crop = card[y1:y2, x1:x2]
+        if crop.size:
+            report = read_qr_code(crop)
+            if report.parsed:
+                return report
+            reports.append(report)
+
+    full_report = read_qr_code(card)
+    if full_report.parsed:
+        return full_report
+    reports.append(full_report)
+
+    for y1, y2, x1, x2 in fallback_regions:
+        crop = card[y1:y2, x1:x2]
+        if crop.size:
+            report = read_qr_code(crop)
+            if report.parsed:
+                return report
+            reports.append(report)
+
+    return best_qr_report(*reports)
+
+
+def qr_region_score(card: np.ndarray, qr_report: QRCodeReport | None = None) -> float:
+    if qr_report is not None and qr_report.parsed:
+        return 8.0
+    if qr_report is not None and "QR_SKIPPED" in qr_report.warnings:
+        crop = card[45:330, 705:1035]
+        if crop.size == 0:
+            return 0.0
+        components = count_dark_components(crop)
+        density = dark_ratio(crop)
+        return min(components / 45.0, 3.0) + min(max(density - 0.06, 0.0) * 12.0, 2.0)
+
     crop = card[45:330, 705:1035]
     if crop.size == 0:
         return 0.0
@@ -214,8 +332,8 @@ def header_region_score(card: np.ndarray) -> float:
     return min(components / 14.0, 3.0) + min(max(density - 0.015, 0.0) * 20.0, 2.0)
 
 
-def card_orientation_score(card: np.ndarray) -> float:
-    return qr_region_score(card) * 1.7 + header_region_score(card)
+def card_orientation_score(card: np.ndarray, qr_report: QRCodeReport | None = None) -> float:
+    return qr_region_score(card, qr_report) * 1.7 + header_region_score(card)
 
 
 def orient_warped_card(card: np.ndarray) -> tuple[np.ndarray, str | None]:
@@ -228,22 +346,65 @@ def orient_warped_card(card: np.ndarray) -> tuple[np.ndarray, str | None]:
     return card, None
 
 
-def read_bubble_fill(gray: np.ndarray, x: int, y: int, radius: int) -> float:
+def read_bubble_fill(image: np.ndarray, x: int, y: int, radius: int) -> float:
     pad = int(radius * 1.65)
     x1, y1 = max(0, x - pad), max(0, y - pad)
-    x2, y2 = min(gray.shape[1], x + pad), min(gray.shape[0], y + pad)
-    roi = gray[y1:y2, x1:x2]
+    x2, y2 = min(image.shape[1], x + pad), min(image.shape[0], y + pad)
+    roi = image[y1:y2, x1:x2]
     if roi.size == 0:
         return 0.0
 
-    _, threshold = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi
+    _, threshold = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     mask = np.zeros_like(threshold)
-    cv2.circle(mask, (min(pad, roi.shape[1] - 1), min(pad, roi.shape[0] - 1)), radius, 255, -1)
+    center = (int(np.clip(x - x1, 0, roi.shape[1] - 1)), int(np.clip(y - y1, 0, roi.shape[0] - 1)))
+    cv2.circle(mask, center, radius, 255, -1)
     dark_pixels = cv2.countNonZero(cv2.bitwise_and(threshold, threshold, mask=mask))
     mask_pixels = cv2.countNonZero(mask)
     if mask_pixels == 0:
         return 0.0
-    return round(float(dark_pixels / mask_pixels), 4)
+
+    inner_mask = np.zeros_like(threshold)
+    cv2.circle(inner_mask, center, max(4, int(radius * 0.68)), 255, -1)
+    inner_pixels = cv2.countNonZero(inner_mask)
+    if inner_pixels == 0:
+        return round(float(dark_pixels / mask_pixels), 4)
+
+    outer_mask = np.zeros_like(threshold)
+    cv2.circle(outer_mask, center, min(pad, int(radius * 1.45)), 255, -1)
+    ring_mask = cv2.subtract(outer_mask, mask)
+    ring_values = gray[ring_mask > 0]
+    inner_values = gray[inner_mask > 0]
+    background = float(np.median(ring_values)) if ring_values.size else float(np.median(gray))
+    local_std = float(np.std(ring_values)) if ring_values.size else float(np.std(gray))
+    darkness_margin = max(12.0, local_std * 0.55)
+    relative_dark = float(np.mean(inner_values < background - darkness_margin)) if inner_values.size else 0.0
+
+    inner_dark_pixels = cv2.countNonZero(cv2.bitwise_and(threshold, threshold, mask=inner_mask))
+    inner_dark = float(inner_dark_pixels / inner_pixels)
+    legacy_dark = float(dark_pixels / mask_pixels)
+
+    saturation_fill = 0.0
+    if roi.ndim == 3:
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+        ring_saturation = saturation[ring_mask > 0]
+        saturation_background = float(np.median(ring_saturation)) if ring_saturation.size else 0.0
+        saturated_ink = (
+            (saturation > max(38.0, saturation_background + 22.0))
+            & (value < 248)
+            & (inner_mask > 0)
+        )
+        saturation_fill = float(np.count_nonzero(saturated_ink) / inner_pixels)
+
+    fill_ratio = max(
+        legacy_dark * 0.88,
+        inner_dark * 1.22,
+        relative_dark * 1.08,
+        saturation_fill * 1.18,
+    )
+    return round(float(clamp(fill_ratio, 0.0, 1.0)), 4)
 
 
 def classify_question_answer(
@@ -287,8 +448,7 @@ def classify_question_answer(
 
 
 def classify_answers(warped: np.ndarray, payload: OMRProcessPayload) -> list[DetectedAnswer]:
-    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    image = cv2.GaussianBlur(warped, (3, 3), 0)
     positions_by_question: dict[int, list[tuple[str, int, int, int]]] = defaultdict(list)
     for position in bubble_positions(len(payload.answerKey)):
         positions_by_question[position.question_number].append(
@@ -301,7 +461,7 @@ def classify_answers(warped: np.ndarray, payload: OMRProcessPayload) -> list[Det
         option_scores: list[BubbleOptionScore] = []
         for option, x, y, radius in positions_by_question[question_number]:
             option_scores.append(
-                BubbleOptionScore(option=option, fillRatio=read_bubble_fill(gray, x, y, radius))
+                BubbleOptionScore(option=option, fillRatio=read_bubble_fill(image, x, y, radius))
             )
 
         detected_answers.append(classify_question_answer(question_number, key_by_number[question_number], option_scores))
@@ -364,6 +524,8 @@ def find_bubble_grid_candidates(image: np.ndarray) -> list[dict[str, float]]:
     min_dimension = min(image.shape[:2])
     min_size = max(8, min_dimension * 0.006)
     max_size = min_dimension * 0.08
+    min_area = max(140.0, min_dimension * min_dimension * 0.00016)
+    max_area = min_dimension * min_dimension * 0.0022
     candidates: list[dict[str, float]] = []
     for contour in contours:
         area = cv2.contourArea(contour)
@@ -375,12 +537,19 @@ def find_bubble_grid_candidates(image: np.ndarray) -> list[dict[str, float]]:
         ratio = w / h
         if ratio < 0.25 or ratio > 2.20:
             continue
-        if area < max(8.0, min_dimension * min_dimension * 0.000006):
+        if area < min_area or area > max_area:
+            continue
+        extent = area / float(w * h)
+        if extent < 0.28 or extent > 0.94:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter else 0
+        if circularity < 0.35:
             continue
         candidates.append({
             "x": x + w / 2,
             "y": y + h / 2,
-            "radius": max(8.0, min(w, h) * 0.44),
+            "radius": max(8.0, min(w, h) * 0.48),
         })
 
     return candidates
@@ -454,11 +623,148 @@ def select_regular_center_groups(
     return sorted(center for _, centers in selected for center in centers)
 
 
-def detect_bubble_grid_answers(image: np.ndarray, payload: OMRProcessPayload) -> list[DetectedAnswer]:
+def classify_answers_from_centers(
+    image: np.ndarray,
+    payload: OMRProcessPayload,
+    row_centers: list[float],
+    x_centers: list[float],
+    radius: float,
+) -> list[DetectedAnswer]:
+    key_by_number = {item.questionNumber: item for item in payload.answerKey}
+    detected_answers: list[DetectedAnswer] = []
+    for row_index, row_center_y in enumerate(row_centers):
+        question_number = row_index + 1
+        if question_number > len(payload.answerKey):
+            break
+
+        option_scores: list[BubbleOptionScore] = []
+        for option, center_x in zip(payload.options, x_centers):
+            option_scores.append(
+                BubbleOptionScore(
+                    option=option,
+                    fillRatio=read_bubble_fill(
+                        image,
+                        int(round(center_x)),
+                        int(round(row_center_y)),
+                        int(round(radius)),
+                    ),
+                )
+            )
+
+        detected_answers.append(classify_question_answer(question_number, key_by_number[question_number], option_scores))
+
+    return sorted(detected_answers, key=lambda answer: answer.questionNumber)
+
+
+def find_horizontal_separator_y(image: np.ndarray) -> float | None:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, threshold = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    height, width = threshold.shape
+    x1, x2 = int(width * 0.08), int(width * 0.92)
+    center_band = threshold[:, x1:x2]
+    kernel_width = max(90, int(width * 0.12))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 1))
+    horizontal = cv2.morphologyEx(center_band, cv2.MORPH_OPEN, kernel)
+
+    search_top = int(height * 0.16)
+    search_bottom = int(height * 0.44)
+    row_strength = np.count_nonzero(horizontal[search_top:search_bottom], axis=1)
+    if row_strength.size == 0:
+        return None
+
+    best_offset = int(np.argmax(row_strength))
+    best_strength = int(row_strength[best_offset])
+    if best_strength < (x2 - x1) * 0.28:
+        return None
+    return float(search_top + best_offset)
+
+
+def infer_legacy_option_centers(image: np.ndarray, separator_y: float, option_count: int) -> list[float]:
+    height, width = image.shape[:2]
+    label_top = int(max(0, separator_y + height * 0.045))
+    label_bottom = int(min(height, separator_y + height * 0.095))
+    label_band = image[label_top:label_bottom, int(width * 0.18):int(width * 0.82)]
+    if label_band.size == 0:
+        scale_x = width / CANONICAL_WIDTH
+        return [value * scale_x for value in (416, 493, 570, 647, 724)[:option_count]]
+
+    gray = cv2.cvtColor(label_band, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, threshold = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(threshold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    x_offset = int(width * 0.18)
+    centers: list[tuple[float, int]] = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        x, _y, w, h = cv2.boundingRect(contour)
+        if area < 20 or area > 600:
+            continue
+        if w < 5 or w > 42 or h < 8 or h > 45:
+            continue
+        center_x = float(x_offset + x + w / 2)
+        if width * 0.25 <= center_x <= width * 0.75:
+            centers.append((center_x, 1))
+
+    if len(centers) >= option_count:
+        clustered = [
+            (float(np.mean(cluster)), len(cluster))
+            for cluster in cluster_axis([center for center, _ in centers], max(14.0, width * 0.012))
+        ]
+        clustered = [
+            item
+            for item in clustered
+            if width * 0.25 <= item[0] <= width * 0.75
+        ]
+        if len(clustered) >= option_count:
+            selected = select_regular_window(
+                [(center, None, count) for center, count in clustered],
+                option_count,
+                min_spacing=width * 0.035,
+                max_spacing=width * 0.095,
+                spacing_penalty=0.7,
+            )
+            if len(selected) == option_count:
+                return [center for center, _unused, _count in selected]
+
+    scale_x = width / CANONICAL_WIDTH
+    return [value * scale_x for value in (416, 493, 570, 647, 724)[:option_count]]
+
+
+def detect_legacy_centered_answers(image: np.ndarray, payload: OMRProcessPayload) -> list[DetectedAnswer]:
+    total_questions = len(payload.answerKey)
+    option_count = len(payload.options)
+    if build_grid_layout(total_questions).columns != 1 or option_count != 5:
+        return []
+
+    height, width = image.shape[:2]
+    if abs(width - CANONICAL_WIDTH) > CANONICAL_WIDTH * 0.18 or abs(height - CANONICAL_HEIGHT) > CANONICAL_HEIGHT * 0.18:
+        return []
+
+    separator_y = find_horizontal_separator_y(image)
+    if separator_y is None:
+        return []
+
+    scale_y = height / CANONICAL_HEIGHT
+    if separator_y < 350 * scale_y:
+        return []
+
+    row_top = separator_y + 170 * scale_y
+    row_spacing = (height - row_top - 140 * scale_y) / max(total_questions - 1, 1)
+    row_spacing = float(clamp(row_spacing, 32 * scale_y, 92 * scale_y))
+    row_centers = [row_top + row_index * row_spacing for row_index in range(total_questions)]
+    if row_centers[-1] > height - 75 * scale_y:
+        return []
+
+    x_centers = infer_legacy_option_centers(image, separator_y, option_count)
+    radius = 20 * min(width / CANONICAL_WIDTH, scale_y)
+    return classify_answers_from_centers(image, payload, row_centers, x_centers, radius)
+
+
+def detect_bubble_grid_answers(image: np.ndarray, payload: OMRProcessPayload) -> list[DetectedAnswer]:
     circles = find_bubble_grid_candidates(image)
-    strict_circles = find_bubble_candidates(image)
     total_questions = len(payload.answerKey)
     option_count = len(payload.options)
     layout = build_grid_layout(total_questions)
@@ -470,21 +776,11 @@ def detect_bubble_grid_answers(image: np.ndarray, payload: OMRProcessPayload) ->
     y_tolerance = max(10.0, median_radius * 1.15)
     x_tolerance = max(18.0, median_radius * 1.6)
     y_clusters = cluster_axis([item["y"] for item in circles], y_tolerance)
-    strict_y_centers: list[float] = []
-    if len(strict_circles) >= total_questions * max(option_count - 2, 2):
-        strict_radius = float(np.median([item["radius"] for item in strict_circles]))
-        strict_y_tolerance = max(10.0, strict_radius * 1.15)
-        strict_y_centers = [
-            float(np.mean(cluster))
-            for cluster in cluster_axis([item["y"] for item in strict_circles], strict_y_tolerance)
-        ]
 
     row_candidates: list[tuple[float, list[dict[str, float]]]] = []
-    min_row_items = max(2, layout.columns * 2)
+    min_row_items = max(3, int(layout.columns * option_count * 0.55))
     for cluster in y_clusters:
         center_y = float(np.mean(cluster))
-        if strict_y_centers and not any(abs(center_y - strict_y) <= max(14.0, y_tolerance * 1.8) for strict_y in strict_y_centers):
-            continue
         group = [item for item in circles if abs(item["y"] - center_y) <= y_tolerance]
         if len(group) >= min_row_items:
             row_candidates.append((center_y, sorted(group, key=lambda item: item["x"])))
@@ -560,7 +856,7 @@ def detect_bubble_grid_answers(image: np.ndarray, payload: OMRProcessPayload) ->
                     BubbleOptionScore(
                         option=option,
                         fillRatio=read_bubble_fill(
-                            gray,
+                            image,
                             int(round(center_x)),
                             int(round(row_center_y)),
                             int(round(max(10.0, median_radius * 1.05))),
@@ -577,6 +873,8 @@ def detect_bubble_grid_answers(image: np.ndarray, payload: OMRProcessPayload) ->
 
 def validate_qr(payload: OMRProcessPayload, qr: QRCodeReport) -> list[str]:
     warnings: list[str] = []
+    if "QR_SKIPPED" in qr.warnings:
+        return warnings
     if not qr.found:
         return ["QR_NOT_FOUND"]
     parsed = qr.parsed or {}
@@ -643,36 +941,33 @@ def analyze_warped_card(
     for orientation_correction, card in candidates:
         fixed_answers = classify_answers(card, payload)
         grid_answers = detect_bubble_grid_answers(card, payload)
+        legacy_answers = detect_legacy_centered_answers(card, payload)
         bubble_candidate_count = len(find_bubble_candidates(card))
         grid_candidate_count = len(find_bubble_grid_candidates(card))
         grid_is_complete = len(grid_answers) == total_questions
+        legacy_is_complete = len(legacy_answers) == total_questions
         incomplete_bubble_grid = (
-            (not grid_is_complete and bubble_grid_is_incomplete(bubble_candidate_count, payload))
-            or (grid_candidate_count >= expected_bubble_count and not grid_is_complete)
+            (not grid_is_complete and not legacy_is_complete and bubble_grid_is_incomplete(bubble_candidate_count, payload))
+            or (grid_candidate_count >= expected_bubble_count and not grid_is_complete and not legacy_is_complete)
         )
 
         fixed_score = answer_quality_score(fixed_answers, total_questions, is_grid=False)
         grid_score = answer_quality_score(grid_answers, total_questions, is_grid=True)
-        if incomplete_bubble_grid and len(grid_answers) != total_questions:
-            detected_answers = []
-            alignment_mode = "marker-bubble-grid-incomplete"
-            answer_score = -50.0
-        elif grid_score > fixed_score + 0.1:
-            detected_answers = grid_answers
-            alignment_mode = "marker-bubble-grid"
-            answer_score = grid_score
-        else:
-            detected_answers = fixed_answers
-            alignment_mode = "marker-template"
-            answer_score = fixed_score
+        legacy_score = answer_quality_score(legacy_answers, total_questions, is_grid=True)
+        answer_candidates = [
+            (fixed_score, fixed_answers, "marker-template"),
+            (grid_score, grid_answers, "marker-bubble-grid"),
+            (legacy_score, legacy_answers, "marker-legacy-centered-grid"),
+        ]
+        answer_score, detected_answers, alignment_mode = max(answer_candidates, key=lambda item: item[0])
 
         completeness_bonus = min(bubble_candidate_count / max(expected_bubble_count, 1), 1.0) * 0.8
         if incomplete_bubble_grid:
             completeness_bonus -= 1.2
 
-        qr = read_qr_code(card)
+        qr = skipped_qr_report() if payload.skipQr else read_card_qr_code(card)
         qr_bonus = 0.8 if qr.parsed else 0.35 if qr.found else 0.0
-        orientation_score = card_orientation_score(card)
+        orientation_score = card_orientation_score(card, qr)
         total_score = answer_score + orientation_score * 0.55 + completeness_bonus + qr_bonus
         analyses.append(
             {
@@ -703,12 +998,16 @@ def get_quality_failures(warnings: list[str], content_type: str | None = None) -
 
 def process_omr_image(image_bytes: bytes, payload: OMRProcessPayload, content_type: str | None = None) -> OMRProcessResponse:
     image = decode_omr_file(image_bytes, content_type)
+    return process_omr_array(image, payload, content_type)
+
+
+def process_omr_array(image: np.ndarray, payload: OMRProcessPayload, content_type: str | None = None) -> OMRProcessResponse:
     quality = evaluate_image_quality(image)
-    qr_original = read_qr_code(image)
     warped, alignment_warning = warp_card(image)
 
     failures: list[str] = []
     if warped is None:
+        qr_original = skipped_qr_report() if payload.skipQr else read_qr_code(image)
         if alignment_warning:
             failures.append(alignment_warning)
         detected_answers = detect_bubble_grid_answers(image, payload)
@@ -827,7 +1126,8 @@ def process_omr_image(image_bytes: bytes, payload: OMRProcessPayload, content_ty
     warped = analysis["card"]
     orientation_correction = analysis["orientationCorrection"]
     qr_warped = analysis["qr"]
-    qr = qr_warped if qr_warped.found else qr_original
+    qr_original = qr_warped if (payload.skipQr or qr_warped.parsed) else read_qr_code(image)
+    qr = best_qr_report(qr_warped, qr_original)
     failures.extend(validate_qr(payload, qr))
     detected_answers = analysis["detectedAnswers"]
     alignment_mode = analysis["alignmentMode"]
@@ -851,13 +1151,12 @@ def process_omr_image(image_bytes: bytes, payload: OMRProcessPayload, content_ty
         failures.append("BLANK_ANSWERS_DETECTED")
     if low_confidence_count:
         failures.append("LOW_CONFIDENCE_ANSWERS")
-    if incomplete_bubble_grid:
+    if incomplete_bubble_grid and len(detected_answers) != len(payload.answerKey):
         failures.append("BUBBLE_GRID_INCOMPLETE")
 
     should_retake = (
         "CARD_NOT_FOUND" in failures
         or "CARD_ALIGNMENT_FAILED" in failures
-        or "BUBBLE_GRID_INCOMPLETE" in failures
         or quality.confidence < 0.45
         or confidence < 0.42
     )
@@ -899,3 +1198,108 @@ def process_omr_image(image_bytes: bytes, payload: OMRProcessPayload, content_ty
             and low_confidence_count == 0,
         },
     )
+
+
+def render_pdf_page(document: pdfium.PdfDocument, index: int) -> np.ndarray:
+    page = document[index]
+    try:
+        bitmap = page.render(scale=settings.pdf_render_scale)
+        pil_image = bitmap.to_pil().convert("RGB")
+    finally:
+        close_page = getattr(page, "close", None)
+        if callable(close_page):
+            close_page()
+
+    rgb = np.array(pil_image)
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
+def process_rendered_pdf_page(
+    index: int,
+    page_count: int,
+    page_image: np.ndarray,
+    payload: OMRProcessPayload,
+) -> tuple[int, OMRProcessResponse]:
+    response = process_omr_array(page_image, payload, content_type="image/jpeg")
+    response.metadata = {
+        **(response.metadata or {}),
+        "sourcePage": index + 1,
+        "sourcePageCount": page_count,
+        "pageConcurrency": settings.page_concurrency,
+        "pdfRenderScale": settings.pdf_render_scale,
+    }
+    return index, response
+
+
+def process_omr_file_pages(
+    file_bytes: bytes,
+    payload: OMRProcessPayload,
+    content_type: str | None = None,
+) -> list[OMRProcessResponse]:
+    normalized_type = (content_type or "").split(";")[0].strip().lower()
+    responses: list[OMRProcessResponse] = []
+
+    if normalized_type == "application/pdf" or file_bytes.startswith(b"%PDF"):
+        try:
+            document = pdfium.PdfDocument(file_bytes)
+        except Exception as error:
+            raise ValueError("PDF_DECODE_FAILED") from error
+
+        try:
+            page_count = len(document)
+            if page_count < 1:
+                raise ValueError("PDF_EMPTY")
+            if page_count > settings.max_pdf_pages:
+                raise ValueError("PDF_PAGE_LIMIT_EXCEEDED")
+
+            page_workers = min(settings.page_concurrency, page_count)
+            if page_workers <= 1:
+                for index in range(page_count):
+                    page_image = render_pdf_page(document, index)
+                    _, response = process_rendered_pdf_page(index, page_count, page_image, payload)
+                    responses.append(response)
+                    del page_image
+                    gc.collect()
+            else:
+                responses_by_index: list[OMRProcessResponse | None] = [None] * page_count
+                pending: dict[Future[tuple[int, OMRProcessResponse]], int] = {}
+
+                def collect_finished_page() -> None:
+                    future = next(as_completed(pending))
+                    page_index, response = future.result()
+                    responses_by_index[page_index] = response
+                    pending.pop(future, None)
+                    gc.collect()
+
+                with ThreadPoolExecutor(max_workers=page_workers) as executor:
+                    for index in range(page_count):
+                        page_image = render_pdf_page(document, index)
+                        future = executor.submit(process_rendered_pdf_page, index, page_count, page_image, payload)
+                        pending[future] = index
+                        del page_image
+
+                        if len(pending) >= page_workers:
+                            collect_finished_page()
+
+                    while pending:
+                        collect_finished_page()
+
+                responses.extend(response for response in responses_by_index if response is not None)
+        finally:
+            close_document = getattr(document, "close", None)
+            if callable(close_document):
+                close_document()
+
+        return responses
+
+    page = decode_omr_file(file_bytes, content_type)
+    response = process_omr_array(page, payload, content_type="image/jpeg")
+    response.metadata = {
+        **(response.metadata or {}),
+        "sourcePage": 1,
+        "sourcePageCount": 1,
+        "pageConcurrency": 1,
+    }
+    responses.append(response)
+
+    return responses

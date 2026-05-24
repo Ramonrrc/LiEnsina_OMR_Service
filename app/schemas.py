@@ -1,5 +1,5 @@
 from typing import Any, Literal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 OptionLabel = Literal["A", "B", "C", "D", "E"]
@@ -7,20 +7,25 @@ QuestionStatus = Literal["ok", "blank", "multiple", "low_confidence", "unreadabl
 
 
 class AnswerKeyItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     questionNumber: int = Field(..., ge=1)
     correctOption: OptionLabel
-    questionId: str | None = None
+    questionId: str | None = Field(default=None, max_length=128)
 
 
 class OMRProcessPayload(BaseModel):
-    examId: str
-    versionId: str
-    answerCardId: str | None = None
-    studentId: str | None = None
-    classId: str | None = None
-    templateVersion: str = "liensina-omr-v1"
-    options: list[OptionLabel] = ["A", "B", "C", "D", "E"]
-    answerKey: list[AnswerKeyItem]
+    model_config = ConfigDict(extra="forbid")
+
+    examId: str = Field(..., min_length=1, max_length=128)
+    versionId: str = Field(..., min_length=1, max_length=128)
+    answerCardId: str | None = Field(default=None, max_length=128)
+    studentId: str | None = Field(default=None, max_length=128)
+    classId: str | None = Field(default=None, max_length=128)
+    templateVersion: str = Field(default="liensina-omr-v1", max_length=64)
+    skipQr: bool = False
+    options: list[OptionLabel] = Field(default_factory=lambda: ["A", "B", "C", "D", "E"], min_length=2, max_length=5)
+    answerKey: list[AnswerKeyItem] = Field(..., min_length=1, max_length=180)
 
     @field_validator("answerKey")
     @classmethod
