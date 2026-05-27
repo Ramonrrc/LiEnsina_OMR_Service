@@ -121,6 +121,26 @@ def test_payload_extra_fields_are_rejected(monkeypatch):
     assert called is False
 
 
+def test_answer_key_is_limited_to_100_questions(monkeypatch):
+    called = False
+
+    def should_not_run(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return fake_response()
+
+    answer_key = [
+        {"questionNumber": index + 1, "correctOption": "A"}
+        for index in range(101)
+    ]
+
+    monkeypatch.setattr(main, "process_omr_image", should_not_run)
+    response = post_process(payload=valid_payload(answerKey=answer_key))
+
+    assert response.status_code == 422
+    assert called is False
+
+
 def test_pdf_page_limit_error_returns_422(monkeypatch):
     def raise_page_limit(*_args, **_kwargs):
         raise ValueError("PDF_PAGE_LIMIT_EXCEEDED")

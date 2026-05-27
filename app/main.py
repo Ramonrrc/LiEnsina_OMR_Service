@@ -1,6 +1,9 @@
 import json
 import asyncio
 import hmac
+from multiprocessing import get_context
+from queue import Empty
+from typing import Any
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +16,7 @@ from app.services.omr_processor import process_omr_file_pages, process_omr_image
 
 
 omr_processing_slots = asyncio.Semaphore(settings.request_concurrency)
+UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 
 app = FastAPI(
     title="LiEnsina OMR Service",
@@ -84,7 +88,58 @@ def detect_allowed_file_type(data: bytes) -> str:
     raise HTTPException(status_code=415, detail="Tipo real do arquivo nao suportado.")
 
 
-async def run_processing_with_timeout(processor, *args, **kwargs):
+def _serialize_processor_result(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_serialize_processor_result(item) for item in value]
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    return value
+
+
+def _run_isolated_processor(processor_name: str, queue, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+    try:
+        processor = process_omr_file_pages if processor_name == "batch" else process_omr_image
+        queue.put(("ok", _serialize_processor_result(processor(*args, **kwargs))))
+    except Exception as error:  # noqa: BLE001 - serialized back to the API process safely.
+        queue.put(("error", error.__class__.__name__, str(error)))
+
+
+async def run_processing_in_isolated_process(processor_name: str, *args, **kwargs):
+    context = get_context("spawn")
+    queue = context.Queue(maxsize=1)
+    process = context.Process(target=_run_isolated_processor, args=(processor_name, queue, args, kwargs))
+    process.start()
+    loop = asyncio.get_running_loop()
+    try:
+        await asyncio.wait_for(loop.run_in_executor(None, process.join), timeout=settings.request_timeout_seconds)
+    except asyncio.TimeoutError as error:
+        process.terminate()
+        await loop.run_in_executor(None, process.join)
+        raise HTTPException(status_code=504, detail="OMR_PROCESSING_TIMEOUT") from error
+
+    if process.exitcode not in (0, None):
+        raise HTTPException(status_code=500, detail="OMR_PROCESSING_FAILED")
+
+    try:
+        status, *payload = queue.get_nowait()
+    except Empty as error:
+        raise HTTPException(status_code=500, detail="OMR_PROCESSING_FAILED") from error
+
+    if status == "error":
+        error_type, message = payload
+        if error_type == "ValueError":
+            raise ValueError(message)
+        raise HTTPException(status_code=400, detail=message)
+
+    result = payload[0]
+    if processor_name == "batch":
+        return [OMRProcessResponse.model_validate(item) for item in result]
+    return OMRProcessResponse.model_validate(result)
+
+
+async def run_processing_with_timeout(processor_name: str, processor, *args, **kwargs):
+    if settings.process_isolation:
+        return await run_processing_in_isolated_process(processor_name, *args, **kwargs)
     try:
         return await asyncio.wait_for(
             run_in_threadpool(processor, *args, **kwargs),
@@ -92,6 +147,20 @@ async def run_processing_with_timeout(processor, *args, **kwargs):
         )
     except asyncio.TimeoutError as error:
         raise HTTPException(status_code=504, detail="OMR_PROCESSING_TIMEOUT") from error
+
+
+async def read_upload_bytes_limited(image: UploadFile) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await image.read(UPLOAD_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > settings.max_upload_bytes:
+            raise HTTPException(status_code=413, detail=f"Arquivo excede {settings.max_upload_mb}MB.")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @app.post("/v1/omr/process", response_model=OMRProcessResponse)
@@ -111,14 +180,13 @@ async def process_omr(
     parsed_payload = parse_payload(payload)
     try:
         async with omr_processing_slots:
-            image_bytes = await image.read()
+            image_bytes = await read_upload_bytes_limited(image)
             if not image_bytes:
                 raise HTTPException(status_code=400, detail="Arquivo vazio.")
-            if len(image_bytes) > settings.max_upload_bytes:
-                raise HTTPException(status_code=413, detail=f"Arquivo excede {settings.max_upload_mb}MB.")
             detected_content_type = detect_allowed_file_type(image_bytes)
 
             return await run_processing_with_timeout(
+                "single",
                 process_omr_image,
                 image_bytes,
                 parsed_payload,
@@ -146,14 +214,13 @@ async def process_omr_batch(
     parsed_payload = parse_payload(payload)
     try:
         async with omr_processing_slots:
-            image_bytes = await image.read()
+            image_bytes = await read_upload_bytes_limited(image)
             if not image_bytes:
                 raise HTTPException(status_code=400, detail="Arquivo vazio.")
-            if len(image_bytes) > settings.max_upload_bytes:
-                raise HTTPException(status_code=413, detail=f"Arquivo excede {settings.max_upload_mb}MB.")
             detected_content_type = detect_allowed_file_type(image_bytes)
 
             return await run_processing_with_timeout(
+                "batch",
                 process_omr_file_pages,
                 image_bytes,
                 parsed_payload,

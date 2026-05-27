@@ -4,6 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 OptionLabel = Literal["A", "B", "C", "D", "E"]
 QuestionStatus = Literal["ok", "blank", "multiple", "low_confidence", "unreadable"]
+MAX_ANSWER_KEY_QUESTIONS = 100
 
 
 class AnswerKeyItem(BaseModel):
@@ -25,7 +26,7 @@ class OMRProcessPayload(BaseModel):
     templateVersion: str = Field(default="liensina-omr-v1", max_length=64)
     skipQr: bool = False
     options: list[OptionLabel] = Field(default_factory=lambda: ["A", "B", "C", "D", "E"], min_length=2, max_length=5)
-    answerKey: list[AnswerKeyItem] = Field(..., min_length=1, max_length=180)
+    answerKey: list[AnswerKeyItem] = Field(..., min_length=1, max_length=MAX_ANSWER_KEY_QUESTIONS)
 
     @field_validator("answerKey")
     @classmethod

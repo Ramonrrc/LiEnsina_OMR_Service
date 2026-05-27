@@ -38,13 +38,8 @@ def _detect_cpu_cores() -> float:
 
 
 def _default_page_concurrency(cpu_cores: float) -> int:
-    if cpu_cores < 2:
-        return 1
-    if cpu_cores < 3:
-        return 2
-    if cpu_cores < 5:
-        return 3
-    return 4
+    _ = cpu_cores
+    return 1
 
 
 def _read_int_env(name: str, fallback: int, min_value: int, max_value: int) -> int:
@@ -73,23 +68,32 @@ def _read_float_env(name: str, fallback: float, min_value: float, max_value: flo
     return max(min_value, min(max_value, value))
 
 
+def _read_bool_env(name: str, fallback: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return fallback
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 _DETECTED_CPU_CORES = _detect_cpu_cores()
 _DEFAULT_PAGE_CONCURRENCY = _default_page_concurrency(_DETECTED_CPU_CORES)
+_ENV = os.getenv("OMR_ENV", "development")
 
 
 @dataclass(frozen=True)
 class Settings:
-    env: str = os.getenv("OMR_ENV", "development")
+    env: str = _ENV
     internal_token: str = os.getenv("OMR_INTERNAL_TOKEN", "").strip()
-    max_upload_mb: int = _read_int_env("OMR_MAX_UPLOAD_MB", 16, 1, 512)
+    max_upload_mb: int = _read_int_env("OMR_MAX_UPLOAD_MB", 16, 1, 64)
     max_payload_kb: int = _read_int_env("OMR_MAX_PAYLOAD_KB", 128, 4, 1024)
     request_concurrency: int = _read_int_env("OMR_REQUEST_CONCURRENCY", 1, 1, 8)
     detected_cpu_cores: float = round(_DETECTED_CPU_CORES, 2)
     page_concurrency: int = _read_auto_int_env("OMR_PAGE_CONCURRENCY", _DEFAULT_PAGE_CONCURRENCY, 1, 6)
     opencv_threads: int = _read_int_env("OMR_OPENCV_THREADS", 1, 1, 8)
     pdf_render_scale: float = _read_float_env("OMR_PDF_RENDER_SCALE", 2.0, 1.5, 3.0)
-    max_pdf_pages: int = _read_int_env("OMR_MAX_PDF_PAGES", 40, 1, 40)
+    max_pdf_pages: int = _read_int_env("OMR_MAX_PDF_PAGES", 20, 1, 20)
     request_timeout_seconds: int = _read_int_env("OMR_REQUEST_TIMEOUT_SECONDS", 90, 1, 120)
+    process_isolation: bool = _read_bool_env("OMR_PROCESS_ISOLATION", _ENV == "production")
     min_confidence_for_auto_approval: float = float(
         os.getenv("OMR_MIN_CONFIDENCE_FOR_AUTO_APPROVAL", "0.88")
     )

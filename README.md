@@ -54,10 +54,10 @@ Para producao, use o `docker-compose.yml` da raiz, que usa `expose: 8000` e nao 
 - `OMR_INTERNAL_TOKEN`: token interno forte.
 - `OMR_MAX_UPLOAD_MB=16`
 - `OMR_REQUEST_CONCURRENCY=1`
-- `OMR_PAGE_CONCURRENCY=auto`
+- `OMR_PAGE_CONCURRENCY=1`
 - `OMR_OPENCV_THREADS=1`
 - `OMR_PDF_RENDER_SCALE=2.6`
-- `OMR_REQUEST_TIMEOUT_SECONDS=20`
+- `OMR_REQUEST_TIMEOUT_SECONDS=120`
 - `OMR_MAX_PDF_PAGES=6`
 - `OMR_MIN_CONFIDENCE_FOR_AUTO_APPROVAL=0.88`
 
@@ -71,3 +71,11 @@ pytest
 ```
 
 Os testes cobrem token interno obrigatorio, magic bytes, rejeicao de payload extra, limite de paginas por PDF, timeout e validacao de QR inconsistente.
+
+## Benchmark OMR local
+
+```bash
+python scripts/benchmark_omr.py --file caminho/do/cartao.pdf --questions 100 --iterations 1 --concurrency 1
+```
+
+Na maquina local testada, o PDF `cartoes_resposta_preenchidos_fotos_celular.pdf` com 20 paginas e gabarito de 100 questoes ficou melhor com `OMR_PAGE_CONCURRENCY=1`.
